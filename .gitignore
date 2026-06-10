@@ -1,0 +1,7 @@
+.venv/
+pairs/
+work/
+__pycache__/
+*.pyc
+*.pyo
+TODO
