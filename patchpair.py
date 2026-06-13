@@ -1342,16 +1342,14 @@ def _make_pair(
         console.print(f"    [yellow]no previous version found[/yellow]")
 
     pair_dir.mkdir(parents=True, exist_ok=True)
-    patched_dest = pair_dir / "patched" / clean
-    patched_dest.parent.mkdir(exist_ok=True)
+    stem = Path(clean).stem
+    ext  = Path(clean).suffix
+    patched_dest = pair_dir / f"{stem}_patched{ext}"
     shutil.copy2(patched_src, patched_dest)
 
     prev_dest: Optional[Path] = None
     if prev_bv:
-        ext        = Path(clean).suffix
-        prev_fname = f"{Path(clean).stem}_prev{ext}"
-        prev_dest  = pair_dir / "prev" / prev_fname
-        prev_dest.parent.mkdir(exist_ok=True)
+        prev_dest = pair_dir / f"{stem}_unpatched{ext}"
         console.print(f"    downloading prev v{prev_bv.version}...")
         if not download_binary(prev_bv, prev_dest):
             console.print(f"    [red]prev download failed — {prev_bv.last_error}[/red]")
@@ -1376,7 +1374,7 @@ def _make_pair(
         "patched": {
             "version": version,
             "sha256": sha256,
-            "file": f"patched/{clean}",
+            "file": f"{stem}_patched{ext}",
         },
         "prev": (
             {
@@ -1384,7 +1382,7 @@ def _make_pair(
                 "sha256": prev_bv.sha256,
                 "kb_numbers": prev_bv.kb_numbers,
                 "win_versions": sorted(prev_bv.win_versions),
-                "file": f"prev/{prev_dest.name}" if prev_dest else None,
+                "file": f"{stem}_unpatched{ext}" if prev_dest else None,
                 "selection_tier": prev_tier,
                 "selection_tier_description": (
                     "CIX exact source match" if prev_tier == 0
