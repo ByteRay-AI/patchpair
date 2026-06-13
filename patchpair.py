@@ -1349,7 +1349,7 @@ def _make_pair(
     prev_dest: Optional[Path] = None
     if prev_bv:
         ext        = Path(clean).suffix
-        prev_fname = f"{Path(clean).stem}_{prev_bv.version.replace('.', '_')}{ext}"
+        prev_fname = f"{Path(clean).stem}_prev{ext}"
         prev_dest  = pair_dir / "prev" / prev_fname
         prev_dest.parent.mkdir(exist_ok=True)
         console.print(f"    downloading prev v{prev_bv.version}...")
