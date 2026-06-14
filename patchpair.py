@@ -311,12 +311,29 @@ def _dt_key(dt: Optional[datetime]) -> float:
     return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
 
 
+def _pe_version_fixedfileinfo(path: Path) -> Optional[str]:
+    """
+    Locates the VS_FIXEDFILEINFO structure (signature 0xFEEF04BD) in the version
+    resource and reads dwFileVersionMS/LS. Used as a fallback when pefile is not
+    installed so the patched/unpatched ordering stays reliable regardless of env.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    i = data.find(b"\xbd\x04\xef\xfe")  # VS_FIXEDFILEINFO dwSignature, little-endian
+    if i == -1 or i + 16 > len(data):
+        return None
+    import struct
+    ms, ls = struct.unpack_from("<II", data, i + 8)  # +8 dwFileVersionMS, +12 dwFileVersionLS
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+
+
 def _pe_version(path: Path) -> Optional[str]:
+    # Prefer pefile when present; otherwise fall back to the stdlib scan so the
+    # patched/unpatched labels are never wrong just because pefile is missing.
     try:
         import pefile  # type: ignore
-    except ImportError:
-        return None
-    try:
         pe = pefile.PE(str(path), fast_load=True)
         pe.parse_data_directories(
             directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
@@ -327,9 +344,11 @@ def _pe_version(path: Path) -> Optional[str]:
             pe.close()
             return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
         pe.close()
+    except ImportError:
+        pass
     except Exception:
         pass
-    return None
+    return _pe_version_fixedfileinfo(path)
 
 
 def _normalize_kb(kb: str) -> str:
@@ -1456,16 +1475,44 @@ def _make_pair(
     pair_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(clean).stem
     ext  = Path(clean).suffix
+
+    # Stage the prev download first; the final _patched/_unpatched names are
+    # assigned by actual PE build version below, so the labels can never be
+    # inverted regardless of how the prev binary was selected.
+    prev_src: Optional[Path] = None
+    if prev_bv:
+        prev_src = work_dir / "prev_bins" / kb / clean
+        console.print(f"    downloading prev v{prev_bv.version}...")
+        if not download_binary(prev_bv, prev_src):
+            console.print(f"    [red]prev download failed — {prev_bv.last_error}[/red]")
+            prev_src = None
+
+    # Ground-truth versions read straight from the PE files. The patched (fixed)
+    # binary is by definition the higher build; if prev-selection handed us a build
+    # newer than the KB binary, swap the labels so _patched is always the newer one.
+    patched_ver = _pe_version(patched_src) or version
+    prev_ver = (_pe_version(prev_src) if prev_src else "") or (prev_bv.version if prev_bv else "")
+    naming_corrected = False
+    if prev_src and patched_ver and prev_ver \
+            and _parse_version(prev_ver) > _parse_version(patched_ver):
+        naming_corrected = True
+        console.print(
+            f"    [yellow]version order inverted: KB binary v{patched_ver} is older than "
+            f"prev v{prev_ver} — swapping _patched/_unpatched labels[/yellow]"
+        )
+        patched_src, prev_src = prev_src, patched_src
+        patched_ver, prev_ver = prev_ver, patched_ver
+
     patched_dest = pair_dir / f"{stem}_patched{ext}"
     shutil.copy2(patched_src, patched_dest)
+    patched_sha = _sha256(patched_src)
 
     prev_dest: Optional[Path] = None
-    if prev_bv:
+    prev_sha = ""
+    if prev_src:
         prev_dest = pair_dir / f"{stem}_unpatched{ext}"
-        console.print(f"    downloading prev v{prev_bv.version}...")
-        if not download_binary(prev_bv, prev_dest):
-            console.print(f"    [red]prev download failed — {prev_bv.last_error}[/red]")
-            prev_dest = None
+        shutil.copy2(prev_src, prev_dest)
+        prev_sha = _sha256(prev_src)
 
     # Attribute CVEs to this specific binary via title keywords (best-effort).
     # relevant_cves is the attributed subset; cves keeps the full KB list.
@@ -1483,15 +1530,18 @@ def _make_pair(
         "relevant_cves": [_cve_to_dict(c) for c in relevant],
         "cve_attribution": attribution,
         "cves": [_cve_to_dict(c) for c in kb_meta.cves],
+        # True when the _patched/_unpatched labels were assigned by PE build version
+        # because the KB binary was older than the selected prev (see naming logic).
+        "naming_corrected": naming_corrected,
         "patched": {
-            "version": version,
-            "sha256": sha256,
+            "version": patched_ver,
+            "sha256": patched_sha,
             "file": f"{stem}_patched{ext}",
         },
         "prev": (
             {
-                "version": prev_bv.version,
-                "sha256": prev_bv.sha256,
+                "version": prev_ver,
+                "sha256": prev_sha or prev_bv.sha256,
                 "kb_numbers": prev_bv.kb_numbers,
                 "win_versions": sorted(prev_bv.win_versions),
                 "file": f"{stem}_unpatched{ext}" if prev_dest else None,
@@ -1579,6 +1629,7 @@ def process_kb(kb_meta: KBMeta, work_dir: Path, output_dir: Path, keep: bool = F
 
     if not keep:
         shutil.rmtree(work_dir / "patched_bins" / kb, ignore_errors=True)
+        shutil.rmtree(work_dir / "prev_bins" / kb, ignore_errors=True)
         shutil.rmtree(work_dir / "extracted" / kb, ignore_errors=True)
     return created
 
