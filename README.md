@@ -26,8 +26,8 @@ For every KB that patches a kernel component, the tool acquires the patched bina
 pairs/
   2024/
     afd_44f548e3/
-      patched/afd.sys
-      prev/afd_10_0_17763_2183.sys
+      afd_patched.sys
+      afd_unpatched.sys
       metadata.json
     clfs_0a1b2c3d/
       ...
@@ -51,11 +51,11 @@ Each `metadata.json` records:
   ],
   "cve_attribution": "title component match",
   "cves": [ /* all enriched CVEs for the KB, as a fallback */ ],
-  "patched": { "version": "10.0.17763.6189", "sha256": "…", "file": "patched/afd.sys" },
+  "patched":  { "version": "10.0.17763.6189", "sha256": "…", "file": "afd_patched.sys" },
   "prev": {
     "version": "10.0.17763.5830", "sha256": "…",
     "kb_numbers": ["KB5037765"], "win_versions": ["10-1809"],
-    "file": "prev/afd_10_0_17763_5830.sys",
+    "file": "afd_unpatched.sys",
     "selection_tier": 1,
     "selection_tier_description": "same Windows version (e.g. both from '10-1809')"
   }
@@ -65,8 +65,7 @@ Each `metadata.json` records:
 ## Install
 
 ```bash
-uv venv
-uv pip install -r requirements.txt
+uv sync
 sudo apt install cabextract   # Linux/macOS — not needed on Windows
 ```
 
@@ -74,19 +73,27 @@ sudo apt install cabextract   # Linux/macOS — not needed on Windows
 
 ```bash
 # Single year
-python patchpair.py --year 2024
+uv run patchpair.py --year 2024
 
 # Year range
-python patchpair.py --year-from 2022 --year-to 2024
+uv run patchpair.py --year-from 2022 --year-to 2024
 
 # Single KB (skips MSRC lookup)
-python patchpair.py --kb KB5041571
+uv run patchpair.py --kb KB5041571
+
+# Single CVE — scans that year's monthly updates to find the KB(s)
+uv run patchpair.py --cve CVE-2024-38193
+
+# MS Security Bulletin — scrapes CVEs from learn.microsoft.com, then finds the KB(s)
+uv run patchpair.py --ms MS16-014
 
 # Preview matching KBs and CVEs without downloading anything
-python patchpair.py --year 2024 --dry-run
+uv run patchpair.py --year 2024 --dry-run
+uv run patchpair.py --cve CVE-2024-38193 --dry-run
+uv run patchpair.py --ms MS16-014 --dry-run
 
 # Custom output / scratch directories; keep intermediate files for inspection
-python patchpair.py --year 2024 --output ./pairs --work-dir ./work --keep
+uv run patchpair.py --year 2024 --output ./pairs --work-dir ./work --keep
 ```
 
 **Scale:** a full year of kernel KBs can mean tens of MSU packages (50–600 MB each) and a few GB of scratch space. Runs are resumable — an existing pair folder is skipped without re-downloading.

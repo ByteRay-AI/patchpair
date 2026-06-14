@@ -471,6 +471,118 @@ def msrc_kernel_kbs(update_id: str) -> dict[str, KBMeta]:
     return kb_map
 
 
+def msrc_cve_kbs(cve_id: str) -> dict[str, KBMeta]:
+    """
+    Find all KBs that fix a given CVE by scanning the monthly CVRF documents
+    for the CVE's year. No kernel-component title filter is applied — the
+    caller already selected the CVE explicitly.
+    """
+    m = re.match(r"CVE-(\d{4})-", cve_id, re.IGNORECASE)
+    if not m:
+        raise ValueError(f"invalid CVE ID format: {cve_id}")
+    year = int(m.group(1))
+
+    update_ids = msrc_update_ids(year, year)
+    kb_map: dict[str, KBMeta] = {}
+
+    with httpx.Client(timeout=60.0) as c:
+        for uid, _ in update_ids:
+            console.print(f"  [dim]scanning {uid}...[/dim]")
+            try:
+                r = c.get(f"{MSRC_API}/cvrf/{uid}", headers=MSRC_HEADERS)
+                r.raise_for_status()
+                doc = r.json()
+            except Exception as e:
+                console.print(f"  [yellow]warning: {uid}: {e}[/yellow]")
+                continue
+
+            release_date = (doc.get("DocumentTracking") or {}).get("InitialReleaseDate", "")[:10]
+
+            for vuln in doc.get("Vulnerability", []):
+                vid = vuln.get("CVE", "")
+                if vid.upper() != cve_id.upper():
+                    continue
+
+                title_raw = vuln.get("Title", {})
+                title = title_raw.get("Value", "") if isinstance(title_raw, dict) else str(title_raw)
+
+                cwe = [
+                    {"id": w.get("ID", ""), "name": w.get("Value", "")}
+                    for w in (vuln.get("CWE") or [])
+                    if isinstance(w, dict) and w.get("ID")
+                ]
+                impact = ""
+                for t in vuln.get("Threats", []):
+                    if t.get("Type") == 0:
+                        d = t.get("Description") or {}
+                        impact = d.get("Value", "") if isinstance(d, dict) else str(d)
+                        if impact:
+                            break
+                cvss: Optional[float] = None
+                for css in vuln.get("CVSSScoreSets", []):
+                    base = css.get("BaseScore")
+                    if base is not None:
+                        try:
+                            cvss = float(base)
+                            break
+                        except (TypeError, ValueError):
+                            pass
+
+                for rem in vuln.get("Remediations", []):
+                    kb_article = rem.get("KBArticle")
+                    if isinstance(kb_article, dict) and kb_article.get("ID"):
+                        kb = _normalize_kb(kb_article["ID"])
+                    else:
+                        desc = rem.get("Description") or {}
+                        val = (desc.get("Value", "") if isinstance(desc, dict) else str(desc)).strip()
+                        if not re.fullmatch(r"\d{6,8}", val):
+                            continue
+                        kb = f"KB{val}"
+
+                    if kb not in kb_map:
+                        kb_map[kb] = KBMeta(kb=kb, release_date=release_date)
+                    known = {c.cve_id for c in kb_map[kb].cves}
+                    if vid not in known:
+                        kb_map[kb].cves.append(
+                            CVEInfo(cve_id=vid, title=title, cwe=cwe, impact=impact, cvss=cvss)
+                        )
+
+            time.sleep(0.3)
+
+    return kb_map
+
+
+def msrc_bulletin_kbs(bulletin_id: str) -> dict[str, KBMeta]:
+    """
+    Find KBs for an MS Security Bulletin (e.g. MS16-014) by:
+      1. Scraping the CVE list from learn.microsoft.com (works for pre-2017 bulletins)
+      2. Calling msrc_cve_kbs() for the first CVE found
+
+    Hacky but works — no official API maps MS bulletins to KBs for older bulletins.
+    """
+    m = re.match(r"MS(\d{2})-(\d+)$", bulletin_id, re.IGNORECASE)
+    if not m:
+        raise ValueError(f"invalid MS bulletin format (expected e.g. MS16-014): {bulletin_id}")
+    year = 2000 + int(m.group(1))
+
+    url = f"https://learn.microsoft.com/en-us/security-updates/securitybulletins/{year}/{bulletin_id.lower()}"
+    console.print(f"  [dim]fetching CVEs from {url}[/dim]")
+
+    with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+        r = c.get(url, headers={"User-Agent": "patchpair/1.0"})
+        r.raise_for_status()
+
+    cves = sorted(set(re.findall(r"CVE-\d{4}-\d+", r.text, re.IGNORECASE)),
+                  key=lambda x: x.upper())
+    if not cves:
+        console.print(f"  [red]no CVEs found on bulletin page[/red]")
+        return {}
+
+    console.print(f"  CVEs in {bulletin_id}: {', '.join(cves)}")
+    # All CVEs in a bulletin are fixed by the same KB package — scan just the first one.
+    return msrc_cve_kbs(cves[0])
+
+
 # --- CVE -> binary attribution ---
 
 def _cve_candidate_files(cves: list[CVEInfo]) -> list[str]:
@@ -1478,6 +1590,8 @@ def run(
     work_dir: Path,
     dry_run: bool = False,
     kb_override: Optional[str] = None,
+    cve_override: Optional[str] = None,
+    bulletin_override: Optional[str] = None,
     keep: bool = False,
 ) -> None:
     _print_banner()
@@ -1488,6 +1602,56 @@ def run(
         meta = KBMeta(kb=_normalize_kb(kb_override), release_date=None)
         if not dry_run:
             process_kb(meta, work_dir, output_dir, keep=keep)
+        return
+
+    if bulletin_override:
+        console.print(f"[bold]Looking up KBs for {bulletin_override}...[/bold]")
+        kb_map = msrc_bulletin_kbs(bulletin_override)
+        if not kb_map:
+            console.print(f"[red]No KBs found for {bulletin_override}[/red]")
+            return
+        console.print(f"  {len(kb_map)} KB(s): {', '.join(kb_map)}")
+        if dry_run:
+            t = Table(title=f"{bulletin_override} — KBs (dry run)")
+            t.add_column("KB", style="cyan")
+            t.add_column("Date")
+            t.add_column("CVEs")
+            for meta in kb_map.values():
+                cve_ids = [c.cve_id for c in meta.cves]
+                t.add_row(meta.kb, meta.release_date or "", ", ".join(cve_ids))
+            console.print(t)
+            return
+        for meta in kb_map.values():
+            year_dir = output_dir / (meta.release_date[:4] if meta.release_date else "unknown")
+            try:
+                process_kb(meta, work_dir, year_dir, keep=keep)
+            except Exception as e:
+                console.print(f"[red]error processing {meta.kb}: {e}[/red]")
+        return
+
+    if cve_override:
+        console.print(f"[bold]Looking up KBs for {cve_override}...[/bold]")
+        kb_map = msrc_cve_kbs(cve_override)
+        if not kb_map:
+            console.print(f"[red]No KBs found for {cve_override}[/red]")
+            return
+        console.print(f"  {len(kb_map)} KB(s): {', '.join(kb_map)}")
+        if dry_run:
+            t = Table(title=f"{cve_override} — KBs (dry run)")
+            t.add_column("KB", style="cyan")
+            t.add_column("Date")
+            t.add_column("CVEs")
+            for meta in kb_map.values():
+                cve_ids = [c.cve_id for c in meta.cves]
+                t.add_row(meta.kb, meta.release_date or "", ", ".join(cve_ids))
+            console.print(t)
+            return
+        for meta in kb_map.values():
+            year_dir = output_dir / (meta.release_date[:4] if meta.release_date else "unknown")
+            try:
+                process_kb(meta, work_dir, year_dir, keep=keep)
+            except Exception as e:
+                console.print(f"[red]error processing {meta.kb}: {e}[/red]")
         return
 
     console.print(f"[bold]Querying MSRC for {year_from}–{year_to}...[/bold]")
@@ -1552,6 +1716,8 @@ def main() -> None:
     grp.add_argument("--year-from", type=int, metavar="YYYY", dest="year_from", help="Start of year range")
     p.add_argument("--year-to", type=int, metavar="YYYY", dest="year_to", help="End of year range (inclusive, default: current year)")
     p.add_argument("--kb", metavar="KBXXXXXXX", help="Process a single KB directly (skips MSRC lookup)")
+    p.add_argument("--cve", metavar="CVE-YYYY-NNNNN", help="Process a single CVE: fetch its KB(s) from MSRC and download the patched binaries")
+    p.add_argument("--ms", metavar="MSYY-NNN", dest="ms_bulletin", help="Process an MS Security Bulletin (e.g. MS16-014): scrape its CVEs then fetch the KB(s)")
     p.add_argument("--output", default="./pairs", metavar="DIR", help="Where to write pair folders (default: ./pairs)")
     p.add_argument("--work-dir", default="./work", metavar="DIR", dest="work_dir", help="Scratch space for downloads and extraction (default: ./work)")
     p.add_argument("--dry-run", action="store_true", help="List matching KBs and CVEs without downloading anything")
@@ -1559,17 +1725,17 @@ def main() -> None:
 
     args = p.parse_args()
 
-    if not args.kb:
+    if not args.kb and not args.cve and not args.ms_bulletin:
         if args.year:
             year_from = year_to = args.year
         elif args.year_from:
             year_from = args.year_from
             year_to = args.year_to or datetime.now().year
         else:
-            p.error("provide --year, --year-from [--year-to], or --kb")
+            p.error("provide --year, --year-from [--year-to], --kb, --cve, or --ms")
             return
     else:
-        year_from = year_to = datetime.now().year  # unused for --kb mode
+        year_from = year_to = datetime.now().year  # unused for --kb / --cve / --ms mode
 
     run(
         year_from=year_from,
@@ -1578,6 +1744,8 @@ def main() -> None:
         work_dir=Path(args.work_dir),
         dry_run=args.dry_run,
         kb_override=args.kb,
+        cve_override=args.cve,
+        bulletin_override=args.ms_bulletin,
         keep=args.keep,
     )
 
