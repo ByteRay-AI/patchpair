@@ -355,6 +355,67 @@ def _pe_version(path: Path) -> Optional[str]:
     return _pe_version_fixedfileinfo(path)
 
 
+def _read_wsz(data: bytes, off: int, end: int) -> tuple[str, int]:
+    """Read a NUL-terminated UTF-16LE string; return (text, offset-after-NUL)."""
+    start = off
+    while off + 1 < end and not (data[off] == 0 and data[off + 1] == 0):
+        off += 2
+    return data[start:off].decode("utf-16-le", "ignore"), off + 2
+
+
+def _pe_file_info(path: Path) -> dict:
+    """Extract the version-resource StringFileInfo fields — the same data Windows
+    shows on a file's Properties → Details tab (FileDescription, CompanyName,
+    ProductName, OriginalFilename, LegalCopyright, ...).
+
+    Dependency-free: walks the VS_VERSIONINFO StringTable directly so it works
+    without pefile. Returns an empty dict if no version resource is present.
+    """
+    import struct
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+
+    marker = "StringFileInfo".encode("utf-16-le")
+    mpos = data.find(marker)
+    if mpos < 6:
+        return {}
+    sfi = mpos - 6  # back up over wLength / wValueLength / wType
+    try:
+        sfi_len = struct.unpack_from("<H", data, sfi)[0]
+    except struct.error:
+        return {}
+    end = min(sfi + sfi_len, len(data)) if sfi_len else len(data)
+
+    align4 = lambda n: (n + 3) & ~3
+    off = align4(mpos + len(marker) + 2)  # past szKey "StringFileInfo\0"
+
+    out: dict[str, str] = {}
+    while off + 6 <= end:
+        st_len = struct.unpack_from("<H", data, off)[0]
+        if st_len == 0:
+            break
+        st_end = min(off + st_len, end)
+        p = off + 6
+        _lang, p = _read_wsz(data, p, st_end)  # 8-hex lang/codepage key
+        p = align4(p)
+        while p + 6 <= st_end:
+            s_len = struct.unpack_from("<H", data, p)[0]
+            if s_len == 0:
+                break
+            s_end = min(p + s_len, st_end)
+            q = p + 6
+            name, q = _read_wsz(data, q, s_end)
+            q = align4(q)
+            value, _ = _read_wsz(data, q, s_end)
+            if name:
+                out[name] = value.strip()
+            p += align4(s_len)
+        off += align4(st_len)
+    return out
+
+
 def _normalize_kb(kb: str) -> str:
     kb = kb.strip().upper()
     return kb if kb.startswith("KB") else f"KB{kb}"
@@ -1195,33 +1256,46 @@ def find_prev(
     return candidates[0], 3
 
 
-def _vt_download(sha256: str, dest: Path, valid) -> bool:
+def _vt_download(sha256: str, dest: Path, valid, max_retries: int = 4) -> bool:
     """Download a file from VirusTotal by SHA256. Requires VT_API_KEY in the env.
 
     Used as a fallback when the symbol server no longer hosts an (often old RTM)
-    binary. Returns True only if the download succeeds and passes `valid`.
+    binary. The free VT API allows only ~4 lookups/min, so on a 429 rate-limit
+    response we pause 60s and retry (up to max_retries times). Returns True only
+    if the download succeeds and passes `valid`.
     """
     api_key = os.environ.get("VT_API_KEY", "").strip()
     if not api_key or not _SHA256_RE.match(sha256.lower()):
         return False
     url = f"{VT_FILE_API}/{sha256.lower()}/download"
     tmp = dest.with_suffix(dest.suffix + ".vt.part")
-    try:
-        with httpx.Client(timeout=300.0, follow_redirects=True) as c:
-            with c.stream("GET", url, headers={"x-apikey": api_key}) as r:
-                if r.status_code != 200:
-                    return False
-                with open(tmp, "wb") as f:
-                    for chunk in r.iter_bytes(8192):
-                        f.write(chunk)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        return False
-    if not valid(tmp):
-        tmp.unlink(missing_ok=True)
-        return False
-    tmp.replace(dest)
-    return True
+
+    for attempt in range(max_retries):
+        try:
+            with httpx.Client(timeout=300.0, follow_redirects=True) as c:
+                with c.stream("GET", url, headers={"x-apikey": api_key}) as r:
+                    if r.status_code == 429:
+                        if attempt < max_retries - 1:
+                            console.print("    [yellow]VirusTotal rate limit (429) — pausing 60s…[/yellow]")
+                            time.sleep(60)
+                            continue
+                        return False
+                    if r.status_code != 200:
+                        return False
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_bytes(8192):
+                            f.write(chunk)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            return False
+
+        if not valid(tmp):
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(dest)
+        return True
+
+    return False
 
 
 def download_binary(bv: BinVersion, dest: Path) -> bool:
@@ -1547,13 +1621,16 @@ def _make_pair(
     patched_dest = pair_dir / f"{stem}_patched{ext}"
     shutil.copy2(patched_src, patched_dest)
     patched_sha = _sha256(patched_src)
+    patched_info = _pe_file_info(patched_src)
 
     prev_dest: Optional[Path] = None
     prev_sha = ""
+    prev_info: dict = {}
     if prev_src:
         prev_dest = pair_dir / f"{stem}_unpatched{ext}"
         shutil.copy2(prev_src, prev_dest)
         prev_sha = _sha256(prev_src)
+        prev_info = _pe_file_info(prev_src)
 
     # Attribute CVEs to this specific binary via title keywords (best-effort).
     # relevant_cves is the attributed subset; cves keeps the full KB list.
@@ -1578,6 +1655,8 @@ def _make_pair(
             "version": patched_ver,
             "sha256": patched_sha,
             "file": f"{stem}_patched{ext}",
+            # StringFileInfo from the PE version resource (Properties → Details).
+            "file_info": patched_info,
         },
         "prev": (
             {
@@ -1586,6 +1665,7 @@ def _make_pair(
                 "kb_numbers": prev_bv.kb_numbers,
                 "win_versions": sorted(prev_bv.win_versions),
                 "file": f"{stem}_unpatched{ext}" if prev_dest else None,
+                "file_info": prev_info,
                 "selection_tier": prev_tier,
                 "selection_tier_description": (
                     "CIX exact source match" if prev_tier == 0
