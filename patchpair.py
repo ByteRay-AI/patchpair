@@ -35,6 +35,8 @@ Usage:
 Requirements:
   uv pip install -r requirements.txt          # httpx, beautifulsoup4, lxml, rich, pefile
   sudo apt install cabextract                 # Linux/macOS (not needed on Windows)
+  export VT_API_KEY=...                        # optional: VirusTotal fallback for
+                                               #   binaries the symbol server dropped
 
 Scale: a full year of kernel KBs can mean tens of MSU packages (50-600 MB each)
 and a few GB of scratch space. --dry-run previews what would be processed.
@@ -48,6 +50,7 @@ import dataclasses
 import gzip
 import hashlib
 import json
+import os
 import platform
 import re
 import shutil
@@ -72,6 +75,7 @@ from rich.table import Table
 MSRC_API       = "https://api.msrc.microsoft.com/cvrf/v2.0"
 WINBINDEX_BASE = "https://winbindex.m417z.com"
 MSDL_BASE      = "https://msdl.microsoft.com/download/symbols"
+VT_FILE_API    = "https://www.virustotal.com/api/v3/files"  # /{sha256}/download
 CATALOG_SEARCH = "https://www.catalog.update.microsoft.com/Search.aspx"
 CATALOG_DIALOG = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx"
 
@@ -1191,11 +1195,42 @@ def find_prev(
     return candidates[0], 3
 
 
+def _vt_download(sha256: str, dest: Path, valid) -> bool:
+    """Download a file from VirusTotal by SHA256. Requires VT_API_KEY in the env.
+
+    Used as a fallback when the symbol server no longer hosts an (often old RTM)
+    binary. Returns True only if the download succeeds and passes `valid`.
+    """
+    api_key = os.environ.get("VT_API_KEY", "").strip()
+    if not api_key or not _SHA256_RE.match(sha256.lower()):
+        return False
+    url = f"{VT_FILE_API}/{sha256.lower()}/download"
+    tmp = dest.with_suffix(dest.suffix + ".vt.part")
+    try:
+        with httpx.Client(timeout=300.0, follow_redirects=True) as c:
+            with c.stream("GET", url, headers={"x-apikey": api_key}) as r:
+                if r.status_code != 200:
+                    return False
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_bytes(8192):
+                        f.write(chunk)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return False
+    if not valid(tmp):
+        tmp.unlink(missing_ok=True)
+        return False
+    tmp.replace(dest)
+    return True
+
+
 def download_binary(bv: BinVersion, dest: Path) -> bool:
     """Download from symbol server to dest. Returns True on success.
 
     Validates the result: SHA256 check if WinBIndex has one, MZ magic otherwise.
     Rejects PA30 delta files that the symbol server occasionally returns.
+    Falls back to VirusTotal (by SHA256) when VT_API_KEY is set and the symbol
+    server can't provide the binary.
     """
     expected_sha256 = bv.sha256.lower() if _SHA256_RE.match(bv.sha256.lower()) else None
 
@@ -1241,13 +1276,19 @@ def download_binary(bv: BinVersion, dest: Path) -> bool:
             net_error = f"{type(e).__name__}: {e}"
             tmp.unlink(missing_ok=True)
 
+    # Symbol server exhausted — try VirusTotal by SHA256 (needs VT_API_KEY).
+    if expected_sha256 and _vt_download(expected_sha256, dest, _valid):
+        console.print(f"    [dim]recovered from VirusTotal: {bv.filename} v{bv.version}[/dim]")
+        return True
+
     # Build a concise failure reason for the caller to surface.
     if net_error:
         bv.last_error = f"network error ({net_error})"
     elif bad_validation:
         bv.last_error = "got 200 but content failed validation (PA30 delta or hash mismatch)"
     elif statuses and all(s == 404 for s in statuses):
-        bv.last_error = "404 — not hosted on symbol server (no matching timestamp/size)"
+        hint = "" if os.environ.get("VT_API_KEY", "").strip() else " (set VT_API_KEY for VirusTotal fallback)"
+        bv.last_error = f"404 — not hosted on symbol server (no matching timestamp/size){hint}"
     elif statuses:
         bv.last_error = f"HTTP {sorted(set(statuses))} from symbol server"
     else:
