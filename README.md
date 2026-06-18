@@ -66,8 +66,14 @@ Each `metadata.json` records:
 
 ```bash
 uv sync
-sudo apt install cabextract   # Linux/macOS — not needed on Windows
+sudo apt install cabextract wimtools   # Linux/macOS — not needed on Windows
 ```
+
+- `cabextract` — unpacks CAB delta packages and nested update payloads.
+- `wimtools` (wimlib) — unpacks WIM-format full MSUs (Windows 11 cumulative updates).
+
+Optional: set `VT_API_KEY` to enable the VirusTotal fallback for previous-version
+binaries the Microsoft Symbol Server no longer hosts.
 
 ## Usage
 

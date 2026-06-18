@@ -13,6 +13,7 @@ update addresses:
        a. delta MSU  -> .mum manifests        -> resolve version on WinBIndex
        b. full MSU   -> PEs from the cabinet, or .mum / CIX index -> WinBIndex
        c. WinBIndex by KB number, when the catalog no longer hosts the KB
+     Full MSUs are CAB on older releases and WIM on Windows 11 (both handled).
      Modern cabinets carry only PA30 deltas (not full PEs); the companion
      *.cix.xml gives the exact patched/previous SHA256 pair when present.
   4. Pick the closest previous version (CIX exact source match, else a 3-tier
@@ -34,7 +35,9 @@ Usage:
 
 Requirements:
   uv pip install -r requirements.txt          # httpx, beautifulsoup4, lxml, rich, pefile
-  sudo apt install cabextract                 # Linux/macOS (not needed on Windows)
+  sudo apt install cabextract wimtools        # Linux/macOS (not needed on Windows)
+                                               #   cabextract: CAB delta packages
+                                               #   wimtools:   WIM-format full MSUs (Win11)
   export VT_API_KEY=...                        # optional: VirusTotal fallback for
                                                #   binaries the symbol server dropped
 
@@ -254,17 +257,24 @@ class BinVersion:
     kb_numbers: list[str]
     win_versions: set[str]  # e.g. {"10-1809", "10-21H1"}
     last_error: str = ""    # populated by download_binary on failure
+    # Set by download_binary: whether the downloaded file's SHA256 matched the
+    # expected one. False means the symbol server served a different (neighboring)
+    # full PE for this version — kept, but flagged inexact in metadata.
+    hash_matched: bool = True
+    actual_sha256: str = ""  # SHA256 of the bytes actually downloaded
 
 
 @dataclasses.dataclass
 class PatchedJob:
-    """One patched binary to turn into a pair. Exactly one source is set:
-      path — a PE already on disk (extracted from the MSU cabinet)
-      bv   — a WinBIndex version to fetch from the symbol server
+    """One patched binary to turn into a pair. Sources (at most one set):
+      path       — a PE already on disk (extracted from the MSU cabinet)
+      bv         — a WinBIndex version to fetch from the symbol server
+      delta_path — a PA30 delta from the cabinet (apply to the source/prev binary)
     """
     clean: str                       # lowercase filename, e.g. "afd.sys"
     path: Optional[Path] = None
     bv: Optional[BinVersion] = None
+    delta_path: Optional[Path] = None  # PA30 delta file (apply via wine)
 
 
 # --- Utilities ---
@@ -850,26 +860,95 @@ def _cab_tool() -> tuple[str, list[str]]:
     )
 
 
-def _extract_cab(cab: Path, out: Path) -> bool:
+def _wim_tool() -> Optional[list[str]]:
+    """Return the wimlib extract command prefix, or None if not installed."""
+    if shutil.which("wimextract"):
+        return ["wimextract"]
+    if shutil.which("wimlib-imagex"):
+        return ["wimlib-imagex", "extract"]
+    return None
+
+
+def _archive_kind(path: Path) -> str:
+    """Sniff a container's format by magic bytes: 'cab', 'wim', or '' (unknown).
+
+    Windows 11 full-MSU cumulative packages are WIM ('MSWIM'); delta packages and
+    the nested update payloads are CAB ('MSCF').
+    """
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(8)
+    except OSError:
+        return ""
+    if magic[:4] == b"MSCF":
+        return "cab"
+    if magic[:5] == b"MSWIM":
+        return "wim"
+    return ""
+
+
+def _wim_image_count(path: Path) -> int:
+    """Number of images in a WIM (default 1 if it can't be determined)."""
+    exe = "wiminfo" if shutil.which("wiminfo") else (
+        "wimlib-imagex" if shutil.which("wimlib-imagex") else None)
+    if exe is None:
+        return 1
+    args = [exe, str(path)] if exe == "wiminfo" else [exe, "info", str(path)]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True).stdout
+    except OSError:
+        return 1
+    m = re.search(r"Image Count:\s*(\d+)", out)
+    return int(m.group(1)) if m else 1
+
+
+def _extract_archive(path: Path, out: Path) -> bool:
+    """Extract a CAB or WIM container to out. Dispatches on the file's magic
+    bytes: WIM (Windows 11 full MSUs) via wimlib, CAB (deltas / nested payloads)
+    via cabextract/expand."""
     out.mkdir(parents=True, exist_ok=True)
+
+    if _archive_kind(path) == "wim":
+        wim = _wim_tool()
+        if wim is None:
+            raise RuntimeError(
+                "wimlib not found (needed for WIM-format MSU packages).\n"
+                "  Ubuntu/Debian: sudo apt install wimtools\n"
+                "  macOS:         brew install wimlib"
+            )
+        # wimextract rejects "all"; extract each image. Single-image WIMs (the
+        # common MSU case) go straight into out; multi-image into per-image dirs.
+        n = max(_wim_image_count(path), 1)
+        ok = False
+        for i in range(1, n + 1):
+            dest = out if n == 1 else out / f"image_{i}"
+            dest.mkdir(parents=True, exist_ok=True)
+            rc = subprocess.run(
+                wim + [str(path), str(i), "--dest-dir", str(dest), "--no-acls"],
+                capture_output=True,
+            ).returncode
+            ok = ok or rc == 0
+        return ok
+
+    # CAB (or unknown — cabextract is lenient and handles embedded cabinets).
     cmd, flags = _cab_tool()
-    args = ([cmd] + flags + [str(cab), str(out)]) if cmd == "expand" \
-        else ([cmd] + flags + ["-d", str(out), str(cab)])
+    args = ([cmd] + flags + [str(path), str(out)]) if cmd == "expand" \
+        else ([cmd] + flags + ["-d", str(out), str(path)])
     return subprocess.run(args, capture_output=True).returncode == 0
 
 
-def _extract_nested_cabs(directory: Path, depth: int = 5) -> None:
-    """MSU packages nest: MSU → CAB → CAB → PSFX.cab → binaries."""
+def _extract_nested_archives(directory: Path, depth: int = 5) -> None:
+    """MSU packages nest: MSU(WIM) → CAB/WIM → PSFX.cab → binaries."""
     if depth <= 0:
         return
-    for cab in list(directory.rglob("*.cab")):
-        marker = cab.parent / f".done_{cab.stem}"
+    for arc in list(directory.rglob("*.cab")) + list(directory.rglob("*.wim")):
+        marker = arc.parent / f".done_{arc.stem}"
         if marker.exists():
             continue
-        out = cab.parent / f"_x_{cab.stem}"
-        if _extract_cab(cab, out):
+        out = arc.parent / f"_x_{arc.stem}"
+        if _extract_archive(arc, out):
             marker.touch()
-            _extract_nested_cabs(out, depth - 1)
+            _extract_nested_archives(out, depth - 1)
 
 
 def _parse_cix_xml(path: Path) -> list[CixEntry]:
@@ -993,9 +1072,9 @@ def extract_delta_mum_entries(package: Path) -> list[MumEntry]:
     seen: dict[str, MumEntry] = {}
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        if not _extract_cab(package, tmp_path):
+        if not _extract_archive(package, tmp_path):
             return []
-        _extract_nested_cabs(tmp_path)
+        _extract_nested_archives(tmp_path)
         for mum in tmp_path.rglob("*.mum"):
             for entry in _parse_mum_file(mum):
                 prev = seen.get(entry.filename)
@@ -1007,12 +1086,13 @@ def extract_delta_mum_entries(package: Path) -> list[MumEntry]:
 def _extract_msu_contents(
     package: Path,
     pe_out_dir: Path,
-) -> tuple[list[Path], list[MumEntry], list[CixEntry]]:
-    """Extract a package once, returning (pe_files, mum_entries, cix_entries).
+) -> tuple[list[Path], list[MumEntry], list[CixEntry], dict[str, Path]]:
+    """Extract a package once, returning (pe_files, mum_entries, cix_entries, delta_map).
 
     pe_files    — kernel-mode x64 PEs found in the cabinet (PA30 deltas skipped).
     mum_entries — kernel-component entries from .mum manifests (for WinBIndex version lookup).
     cix_entries — source/target SHA256 pairs from *.cix.xml (for exact-match lookup).
+    delta_map   — clean filename -> PA30 delta path (for wine-based delta application).
 
     All collected in one pass so the large MSU is only unpacked once.
     """
@@ -1023,10 +1103,10 @@ def _extract_msu_contents(
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        if not _extract_cab(package, tmp_path):
+        if not _extract_archive(package, tmp_path):
             console.print(f"  [red]extraction failed: {package.name}[/red]")
-            return [], [], []
-        _extract_nested_cabs(tmp_path)
+            return [], [], [], {}
+        _extract_nested_archives(tmp_path)
 
         for f in tmp_path.rglob("*"):
             if not f.is_file():
@@ -1057,11 +1137,13 @@ def _extract_msu_contents(
                 collected[clean] = (f, arch)
 
         pe_files: list[Path] = []
+        delta_map: dict[str, Path] = {}
         for clean, (src, _) in collected.items():
             if not _is_pe(src):
-                # PA30 delta — register for WinBIndex lookup if .mum didn't cover it.
-                # CIX target SHA256 (if present) makes this reliable; KB-number is the
-                # fallback.  Version is left empty here; _resolve_winbindex_jobs fills it in.
+                # PA30 delta — copy to pe_out_dir for wine-based application later.
+                delta_dest = pe_out_dir / f"{clean}.pa30"
+                shutil.copy2(src, delta_dest)
+                delta_map[clean] = delta_dest
                 if clean not in mum_seen:
                     mum_seen[clean] = MumEntry(filename=clean, version="", sha256="")
                 continue
@@ -1069,7 +1151,7 @@ def _extract_msu_contents(
             shutil.copy2(src, dest)
             pe_files.append(dest)
 
-    return pe_files, list(mum_seen.values()), list(cix_seen.values())
+    return pe_files, list(mum_seen.values()), list(cix_seen.values()), delta_map
 
 
 # --- WinBIndex client ---
@@ -1265,10 +1347,14 @@ def _vt_download(sha256: str, dest: Path, valid, max_retries: int = 4) -> bool:
     if the download succeeds and passes `valid`.
     """
     api_key = os.environ.get("VT_API_KEY", "").strip()
-    if not api_key or not _SHA256_RE.match(sha256.lower()):
+    if not api_key:
+        return False
+    if not _SHA256_RE.match(sha256.lower()):
+        console.print("    [yellow]VirusTotal skipped: no usable SHA256 to look up[/yellow]")
         return False
     url = f"{VT_FILE_API}/{sha256.lower()}/download"
     tmp = dest.with_suffix(dest.suffix + ".vt.part")
+    console.print(f"    [dim]trying VirusTotal by sha256 {sha256[:12]}…[/dim]")
 
     for attempt in range(max_retries):
         try:
@@ -1279,17 +1365,26 @@ def _vt_download(sha256: str, dest: Path, valid, max_retries: int = 4) -> bool:
                             console.print("    [yellow]VirusTotal rate limit (429) — pausing 60s…[/yellow]")
                             time.sleep(60)
                             continue
+                        console.print("    [yellow]VirusTotal: still rate-limited (429) after retries[/yellow]")
                         return False
                     if r.status_code != 200:
+                        if r.status_code in (401, 403):
+                            console.print(f"    [yellow]VirusTotal HTTP {r.status_code}: key rejected or lacks file-download privilege[/yellow]")
+                        elif r.status_code == 404:
+                            console.print("    [yellow]VirusTotal 404: file not present in VT for this hash[/yellow]")
+                        else:
+                            console.print(f"    [yellow]VirusTotal HTTP {r.status_code}[/yellow]")
                         return False
                     with open(tmp, "wb") as f:
                         for chunk in r.iter_bytes(8192):
                             f.write(chunk)
-        except Exception:
+        except Exception as e:
+            console.print(f"    [yellow]VirusTotal error: {type(e).__name__}: {e}[/yellow]")
             tmp.unlink(missing_ok=True)
             return False
 
         if not valid(tmp):
+            console.print("    [yellow]VirusTotal: downloaded file failed hash validation[/yellow]")
             tmp.unlink(missing_ok=True)
             return False
         tmp.replace(dest)
@@ -1308,24 +1403,30 @@ def download_binary(bv: BinVersion, dest: Path) -> bool:
     """
     expected_sha256 = bv.sha256.lower() if _SHA256_RE.match(bv.sha256.lower()) else None
 
-    def _valid(path: Path) -> bool:
-        if expected_sha256:
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-            return h.hexdigest() == expected_sha256
-        return _is_pe(path)
+    def _sha(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _exact(path: Path) -> bool:
+        return _sha(path) == expected_sha256 if expected_sha256 else _is_pe(path)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
-        if _valid(dest):
+        if _exact(dest):
+            bv.hash_matched = True
+            bv.actual_sha256 = _sha(dest)
             return True
         dest.unlink()
+
     tmp = dest.with_suffix(dest.suffix + ".part")
-    statuses: list[int] = []     # HEAD status per candidate URL
-    bad_validation = False       # got 200 but content was wrong (PA30 / hash mismatch)
-    net_error = ""               # last transport-level exception
+    fallback = dest.with_suffix(dest.suffix + ".inexact")  # full PE, wrong hash
+    have_fallback = False
+    statuses: list[int] = []
+    bad_validation = False       # got 200 but content was a PA30 delta / non-PE
+    net_error = ""
     for url in bv.urls:
         try:
             with httpx.Client(timeout=120.0, follow_redirects=True) as c:
@@ -1340,26 +1441,51 @@ def download_binary(bv: BinVersion, dest: Path) -> bool:
                     with open(tmp, "wb") as f:
                         for chunk in r.iter_bytes(8192):
                             f.write(chunk)
-            if not _valid(tmp):
-                bad_validation = True
+            if _exact(tmp):
+                tmp.replace(dest)
+                bv.hash_matched = True
+                bv.actual_sha256 = _sha(dest)
+                return True
+            # Not an exact match. If it's still a full PE, keep the first one as a
+            # fallback (a neighboring build) but keep looking for an exact match.
+            if _is_pe(tmp):
+                if not have_fallback:
+                    tmp.replace(fallback)
+                    have_fallback = True
+                else:
+                    tmp.unlink(missing_ok=True)
+            else:
+                bad_validation = True  # PA30 delta or garbage — unusable
                 tmp.unlink(missing_ok=True)
-                continue
-            tmp.replace(dest)
-            return True
         except Exception as e:
             net_error = f"{type(e).__name__}: {e}"
             tmp.unlink(missing_ok=True)
 
-    # Symbol server exhausted — try VirusTotal by SHA256 (needs VT_API_KEY).
-    if expected_sha256 and _vt_download(expected_sha256, dest, _valid):
+    # No exact match from the symbol server — try VirusTotal (exact, needs key).
+    if expected_sha256 and _vt_download(expected_sha256, dest, _exact):
         console.print(f"    [dim]recovered from VirusTotal: {bv.filename} v{bv.version}[/dim]")
+        bv.hash_matched = True
+        bv.actual_sha256 = _sha(dest)
+        if have_fallback:
+            fallback.unlink(missing_ok=True)
+        return True
+
+    # No exact source anywhere — accept the full-PE fallback if we have one,
+    # flagged as an inexact (neighboring-build) match for the caller to note.
+    if have_fallback:
+        fallback.replace(dest)
+        bv.hash_matched = False
+        bv.actual_sha256 = _sha(dest)
+        console.print(f"    [yellow]{bv.filename}: kept full PE with mismatched hash "
+                      f"(got {bv.actual_sha256[:12]}, wanted {(expected_sha256 or '?')[:12]}) "
+                      f"— flagged inexact[/yellow]")
         return True
 
     # Build a concise failure reason for the caller to surface.
     if net_error:
         bv.last_error = f"network error ({net_error})"
     elif bad_validation:
-        bv.last_error = "got 200 but content failed validation (PA30 delta or hash mismatch)"
+        bv.last_error = "got 200 but content was a PA30 delta / non-PE (unusable)"
     elif statuses and all(s == 404 for s in statuses):
         hint = "" if os.environ.get("VT_API_KEY", "").strip() else " (set VT_API_KEY for VirusTotal fallback)"
         bv.last_error = f"404 — not hosted on symbol server (no matching timestamp/size){hint}"
@@ -1368,6 +1494,47 @@ def download_binary(bv: BinVersion, dest: Path) -> bool:
     else:
         bv.last_error = "no candidate URLs"
     return False
+
+
+# --- PA30 delta application ---
+
+_APPLYDELTA_EXE = Path(__file__).parent / "delta" / "applydelta.exe"
+_WINEPREFIX = Path(__file__).parent / "delta" / ".wineprefix"
+
+
+def _apply_pa30_delta(base_path: Path, delta_path: Path, out_path: Path) -> bool:
+    """Apply a PA30 delta to a base binary via wine + applydelta.exe.
+
+    Returns True if out_path is written and is a valid PE.
+    """
+    if not _APPLYDELTA_EXE.exists():
+        console.print(f"    [yellow]applydelta.exe not found at {_APPLYDELTA_EXE}[/yellow]")
+        return False
+    if not shutil.which("wine"):
+        console.print("    [yellow]wine not found — cannot apply PA30 delta[/yellow]")
+        return False
+
+    env = os.environ.copy()
+    if _WINEPREFIX.exists():
+        env["WINEPREFIX"] = str(_WINEPREFIX)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            ["wine", str(_APPLYDELTA_EXE), str(base_path), str(delta_path), str(out_path)],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+    except Exception as e:
+        console.print(f"    [yellow]wine error: {e}[/yellow]")
+        return False
+
+    if result.returncode != 0 or not out_path.exists():
+        stderr = result.stderr.strip().splitlines()
+        stderr = [l for l in stderr if not l.startswith("it looks like wine32") and "dpkg --add-architecture" not in l]
+        console.print(f"    [yellow]applydelta failed (rc={result.returncode}): {' '.join(stderr[-2:])}[/yellow]")
+        return False
+
+    return _is_pe(out_path)
 
 
 # --- Pairing / orchestration ---
@@ -1537,10 +1704,11 @@ def _make_pair(
                 return done
         staging = work_dir / "patched_bins" / kb / clean
         console.print(f"  downloading {clean} v{bv.version}...")
-        if not download_binary(bv, staging):
+        if download_binary(bv, staging):
+            patched_src = staging
+        else:
             console.print(f"    [yellow]{clean}: patched download failed — {bv.last_error}[/yellow]")
             return None
-        patched_src = staging
 
     sha256  = _sha256(patched_src)
     # pefile first; fall back to the WinBIndex-supplied version when available.
@@ -1607,6 +1775,14 @@ def _make_pair(
     # newer than the KB binary, swap the labels so _patched is always the newer one.
     patched_ver = _pe_version(patched_src) or version
     prev_ver = (_pe_version(prev_src) if prev_src else "") or (prev_bv.version if prev_bv else "")
+
+    # Per-side exactness: a cabinet PE (job.path) is exact by definition; downloaded
+    # binaries carry hash_matched/actual_sha256 from download_binary.
+    patched_exact = job.bv.hash_matched if job.bv else True
+    patched_expected = job.bv.sha256 if job.bv else ""
+    prev_exact = prev_bv.hash_matched if prev_bv else True
+    prev_expected = prev_bv.sha256 if prev_bv else ""
+
     naming_corrected = False
     if prev_src and patched_ver and prev_ver \
             and _parse_version(prev_ver) > _parse_version(patched_ver):
@@ -1617,20 +1793,26 @@ def _make_pair(
         )
         patched_src, prev_src = prev_src, patched_src
         patched_ver, prev_ver = prev_ver, patched_ver
+        patched_exact, prev_exact = prev_exact, patched_exact
+        patched_expected, prev_expected = prev_expected, patched_expected
+
+    # An incomplete pair (only one binary, because the previous version wasn't
+    # found or failed to download) is not useful — drop the whole folder rather
+    # than leaving a lone patched binary behind.
+    if prev_src is None:
+        console.print(f"    [yellow]{clean}: no usable previous binary — discarding incomplete pair[/yellow]")
+        shutil.rmtree(pair_dir, ignore_errors=True)
+        return None
 
     patched_dest = pair_dir / f"{stem}_patched{ext}"
     shutil.copy2(patched_src, patched_dest)
     patched_sha = _sha256(patched_src)
     patched_info = _pe_file_info(patched_src)
 
-    prev_dest: Optional[Path] = None
-    prev_sha = ""
-    prev_info: dict = {}
-    if prev_src:
-        prev_dest = pair_dir / f"{stem}_unpatched{ext}"
-        shutil.copy2(prev_src, prev_dest)
-        prev_sha = _sha256(prev_src)
-        prev_info = _pe_file_info(prev_src)
+    prev_dest = pair_dir / f"{stem}_unpatched{ext}"
+    shutil.copy2(prev_src, prev_dest)
+    prev_sha = _sha256(prev_src)
+    prev_info = _pe_file_info(prev_src)
 
     # Attribute CVEs to this specific binary via title keywords (best-effort).
     # relevant_cves is the attributed subset; cves keeps the full KB list.
@@ -1655,6 +1837,10 @@ def _make_pair(
             "version": patched_ver,
             "sha256": patched_sha,
             "file": f"{stem}_patched{ext}",
+            # False when the symbol server only had a neighboring build for this
+            # version: the file is a real full PE but not the exact requested hash.
+            "hash_match": patched_exact,
+            "expected_sha256": None if patched_exact else (patched_expected or None),
             # StringFileInfo from the PE version resource (Properties → Details).
             "file_info": patched_info,
         },
@@ -1665,6 +1851,8 @@ def _make_pair(
                 "kb_numbers": prev_bv.kb_numbers,
                 "win_versions": sorted(prev_bv.win_versions),
                 "file": f"{stem}_unpatched{ext}" if prev_dest else None,
+                "hash_match": prev_exact,
+                "expected_sha256": None if prev_exact else (prev_expected or None),
                 "file_info": prev_info,
                 "selection_tier": prev_tier,
                 "selection_tier_description": (
@@ -1715,12 +1903,15 @@ def process_kb(kb_meta: KBMeta, work_dir: Path, output_dir: Path, keep: bool = F
         else:
             ext_dir = work_dir / "extracted" / kb
             console.print("  extracting full MSU...")
-            cabinet_pes, mum_entries, cix_entries = _extract_msu_contents(msu, ext_dir)
+            cabinet_pes, mum_entries, cix_entries, delta_map = _extract_msu_contents(msu, ext_dir)
             if not keep:
                 msu.unlink(missing_ok=True)
 
             if cix_entries:
                 console.print(f"  [dim]CIX entries: {[e.filename for e in cix_entries]}[/dim]")
+
+            if delta_map:
+                console.print(f"  [dim]PA30 deltas: {list(delta_map)}[/dim]")
 
             if cabinet_pes:
                 # Old-style KB: cabinet contains actual PEs.
@@ -1730,6 +1921,12 @@ def process_kb(kb_meta: KBMeta, work_dir: Path, output_dir: Path, keep: bool = F
                 console.print("  [dim]cabinet has no PEs (PA30 only) — trying WinBIndex[/dim]")
                 console.print(f"  .mum entries: {[e.filename for e in mum_entries]}")
                 jobs = _resolve_winbindex_jobs(kb, mum_entries, cix_entries=cix_entries)
+
+            # Attach PA30 delta paths to jobs for wine-based fallback.
+            if delta_map:
+                for job in jobs:
+                    if job.clean in delta_map:
+                        job.delta_path = delta_map[job.clean]
 
         if not jobs:
             console.print("  [yellow]no valid binaries found for this KB[/yellow]")
@@ -1767,6 +1964,11 @@ def run(
     keep: bool = False,
 ) -> None:
     _print_banner()
+    if os.environ.get("VT_API_KEY", "").strip():
+        console.print("  VirusTotal fallback: [green]VT_API_KEY set[/green]", style="dim")
+    else:
+        console.print("  VirusTotal fallback: [yellow]VT_API_KEY NOT set[/yellow] "
+                      "(symbol-server misses won't be recovered)", style="dim")
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
