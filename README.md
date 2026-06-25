@@ -1,4 +1,13 @@
-# PatchPair
+```
+██████╗  █████╗ ████████╗ ██████╗██╗  ██╗██████╗  █████╗ ██╗██████╗
+██╔══██╗██╔══██╗╚══██╔══╝██╔════╝██║  ██║██╔══██╗██╔══██╗██║██╔══██╗
+██████╔╝███████║   ██║   ██║     ███████║██████╔╝███████║██║██████╔╝
+██╔═══╝ ██╔══██║   ██║   ██║     ██╔══██║██╔═══╝ ██╔══██║██║██╔══██╗
+██║     ██║  ██║   ██║   ╚██████╗██║  ██║██║     ██║  ██║██║██║  ██║
+╚═╝     ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝
+```
+
+---
 
 Builds a dataset of **before/after Windows kernel-mode binary pairs** from Microsoft's Patch Tuesday security updates, each annotated with the CVEs (and CWE / impact / CVSS) the update addresses.
 
