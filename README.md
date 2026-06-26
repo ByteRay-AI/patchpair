@@ -109,6 +109,11 @@ uv run patchpair.py --ms MS16-014 --dry-run
 
 # Custom output / scratch directories; keep intermediate files for inspection
 uv run patchpair.py --year 2024 --output ./pairs --work-dir ./work --keep
+
+# Process several KBs concurrently (KB-level parallelism); keep N small (3-4)
+# to avoid rate-limiting and excessive scratch usage. Per-file progress bars
+# are disabled while N > 1.
+uv run patchpair.py --year 2024 --jobs 4
 ```
 
 **Scale:** a full year of kernel KBs can mean tens of MSU packages (50–600 MB each) and a few GB of scratch space. Runs are resumable — an existing pair folder is skipped without re-downloading.

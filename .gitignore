@@ -6,3 +6,5 @@ __pycache__/
 *.pyo
 TODO
 delta/
+diff-work/
+diff-work-finished/

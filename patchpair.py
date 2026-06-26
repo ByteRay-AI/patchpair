@@ -32,6 +32,7 @@ Usage:
   python patchpair.py --year-from 2023 --year-to 2024
   python patchpair.py --kb KB5034122          # single KB, skip MSRC lookup
   python patchpair.py --year 2024 --dry-run   # list KBs without downloading
+  python patchpair.py --year 2024 --jobs 4    # process 4 KBs concurrently
 
 Requirements:
   uv pip install -r requirements.txt          # httpx, beautifulsoup4, lxml, rich, pefile
@@ -61,9 +62,10 @@ import subprocess
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from bs4 import BeautifulSoup
@@ -199,7 +201,42 @@ _CVE_BINARY_HINTS: list[tuple[re.Pattern, list[str]]] = [
 
 console = Console()
 
-# Startup banner (ASCII art tool name + small attribution line).
+# Live progress bars (rich.Progress) take over the terminal and cannot be safely
+# nested/concurrent on a single console. They are disabled when KB-level
+# concurrency is active (--jobs > 1); downloads still run, just without a bar.
+_PROGRESS_ENABLED = True
+
+
+class _NullProgress:
+    """Drop-in no-op stand-in for rich.Progress used in concurrent mode."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def add_task(self, *args, **kwargs):
+        return 0
+
+    def update(self, *args, **kwargs):
+        pass
+
+
+def _download_progress():
+    """A rich.Progress for download bars, or a no-op when progress is disabled."""
+    if not _PROGRESS_ENABLED:
+        return _NullProgress()
+    return Progress(
+        TextColumn("  [cyan]{task.fields[fn]}"),
+        BarColumn(bar_width=40),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        DownloadColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+
+
 _BANNER = r"""
 ██████╗  █████╗ ████████╗ ██████╗██╗  ██╗██████╗  █████╗ ██╗██████╗
 ██╔══██╗██╔══██╗╚══██╔══╝██╔════╝██║  ██║██╔══██╗██╔══██╗██║██╔══██╗
@@ -824,14 +861,7 @@ def download_kb_package(kb: str, dest_dir: Path) -> Optional[Path]:
                 with c.stream("GET", url, headers=HTTP_HEADERS) as r:
                     r.raise_for_status()
                     total = int(r.headers.get("content-length", 0))
-                    with Progress(
-                        TextColumn("  [cyan]{task.fields[fn]}"),
-                        BarColumn(bar_width=40),
-                        "[progress.percentage]{task.percentage:>3.0f}%",
-                        DownloadColumn(),
-                        TimeRemainingColumn(),
-                        console=console,
-                    ) as prog:
+                    with _download_progress() as prog:
                         task = prog.add_task("dl", fn=filename, total=total or None)
                         with open(tmp, "wb") as f:
                             for chunk in r.iter_bytes(8192):
@@ -1632,14 +1662,7 @@ def _try_delta_path(kb: str, work_dir: Path, keep: bool = False) -> Optional[lis
                 with c.stream("GET", url, headers=HTTP_HEADERS) as r:
                     r.raise_for_status()
                     total = int(r.headers.get("content-length", 0))
-                    with Progress(
-                        TextColumn("  [cyan]{task.fields[fn]}"),
-                        BarColumn(bar_width=40),
-                        "[progress.percentage]{task.percentage:>3.0f}%",
-                        DownloadColumn(),
-                        TimeRemainingColumn(),
-                        console=console,
-                    ) as prog:
+                    with _download_progress() as prog:
                         task = prog.add_task("dl", fn=filename, total=total or None)
                         with open(tmp, "wb") as f:
                             for chunk in r.iter_bytes(8192):
@@ -1952,6 +1975,42 @@ def process_kb(kb_meta: KBMeta, work_dir: Path, output_dir: Path, keep: bool = F
     return created
 
 
+def _process_kb_batch(
+    metas: list[KBMeta],
+    work_dir: Path,
+    output_dir_for: Callable[[KBMeta], Path],
+    keep: bool,
+    jobs: int,
+) -> None:
+    """Process a list of KBs, sequentially (jobs <= 1) or with KB-level concurrency.
+
+    output_dir_for maps each KBMeta to the directory its pair folders are written to.
+    Failures in one KB are logged and never abort the rest of the batch.
+    """
+    if jobs <= 1:
+        for meta in metas:
+            try:
+                process_kb(meta, work_dir, output_dir_for(meta), keep=keep)
+            except Exception as e:
+                console.print(f"[red]error processing {meta.kb}: {e}[/red]")
+            time.sleep(1)
+        return
+
+    console.print(f"[bold]Processing {len(metas)} KB(s) with {jobs} workers "
+                  f"(per-file progress bars disabled)[/bold]")
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {
+            pool.submit(process_kb, meta, work_dir, output_dir_for(meta), keep): meta
+            for meta in metas
+        }
+        for fut in as_completed(futures):
+            meta = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                console.print(f"[red]error processing {meta.kb}: {e}[/red]")
+
+
 def run(
     year_from: int,
     year_to: int,
@@ -1962,7 +2021,14 @@ def run(
     cve_override: Optional[str] = None,
     bulletin_override: Optional[str] = None,
     keep: bool = False,
+    jobs: int = 1,
 ) -> None:
+    global _PROGRESS_ENABLED
+    jobs = max(1, jobs)
+    # Live download bars cannot be shared across threads; disable them when running
+    # KB-level concurrency so parallel downloads don't garble the terminal.
+    _PROGRESS_ENABLED = jobs <= 1
+
     _print_banner()
     if os.environ.get("VT_API_KEY", "").strip():
         console.print("  VirusTotal fallback: [green]VT_API_KEY set[/green]", style="dim")
@@ -1971,6 +2037,9 @@ def run(
                       "(symbol-server misses won't be recovered)", style="dim")
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    def _year_dir(meta: KBMeta) -> Path:
+        return output_dir / (meta.release_date[:4] if meta.release_date else "unknown")
 
     if kb_override:
         meta = KBMeta(kb=_normalize_kb(kb_override), release_date=None)
@@ -1995,12 +2064,7 @@ def run(
                 t.add_row(meta.kb, meta.release_date or "", ", ".join(cve_ids))
             console.print(t)
             return
-        for meta in kb_map.values():
-            year_dir = output_dir / (meta.release_date[:4] if meta.release_date else "unknown")
-            try:
-                process_kb(meta, work_dir, year_dir, keep=keep)
-            except Exception as e:
-                console.print(f"[red]error processing {meta.kb}: {e}[/red]")
+        _process_kb_batch(list(kb_map.values()), work_dir, _year_dir, keep, jobs)
         return
 
     if cve_override:
@@ -2020,12 +2084,7 @@ def run(
                 t.add_row(meta.kb, meta.release_date or "", ", ".join(cve_ids))
             console.print(t)
             return
-        for meta in kb_map.values():
-            year_dir = output_dir / (meta.release_date[:4] if meta.release_date else "unknown")
-            try:
-                process_kb(meta, work_dir, year_dir, keep=keep)
-            except Exception as e:
-                console.print(f"[red]error processing {meta.kb}: {e}[/red]")
+        _process_kb_batch(list(kb_map.values()), work_dir, _year_dir, keep, jobs)
         return
 
     console.print(f"[bold]Querying MSRC for {year_from}–{year_to}...[/bold]")
@@ -2069,13 +2128,8 @@ def run(
         console.print(t)
         return
 
-    for meta in sorted(all_kbs.values(), key=lambda m: m.release_date or ""):
-        year_dir = output_dir / (meta.release_date[:4] if meta.release_date else "unknown")
-        try:
-            process_kb(meta, work_dir, year_dir, keep=keep)
-        except Exception as e:
-            console.print(f"[red]error processing {meta.kb}: {e}[/red]")
-        time.sleep(1)
+    metas = sorted(all_kbs.values(), key=lambda m: m.release_date or "")
+    _process_kb_batch(metas, work_dir, _year_dir, keep, jobs)
 
 
 # --- CLI ---
@@ -2096,6 +2150,10 @@ def main() -> None:
     p.add_argument("--work-dir", default="./work", metavar="DIR", dest="work_dir", help="Scratch space for downloads and extraction (default: ./work)")
     p.add_argument("--dry-run", action="store_true", help="List matching KBs and CVEs without downloading anything")
     p.add_argument("--keep", action="store_true", help="Keep work/extracted files after processing (for inspection)")
+    p.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                   help="Number of KBs to process concurrently (default: 1). "
+                        "Values > 1 disable per-file progress bars; keep N small "
+                        "(e.g. 3-4) to avoid rate-limiting and excessive scratch usage.")
 
     args = p.parse_args()
 
@@ -2121,6 +2179,7 @@ def main() -> None:
         cve_override=args.cve,
         bulletin_override=args.ms_bulletin,
         keep=args.keep,
+        jobs=args.jobs,
     )
 
 
